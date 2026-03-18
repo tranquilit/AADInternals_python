@@ -21,7 +21,7 @@ import xmltodict
 
 aadsync_server=        "adminwebservice.microsoftonline.com"
 aadsync_client_version="8.0"
-aadsync_client_build=  "2.4.21.0"
+aadsync_client_build=  "2.6.3.0"
 client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
 class AADInternals():
