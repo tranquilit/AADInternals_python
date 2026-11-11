@@ -5,7 +5,6 @@ import json
 import sys
 import os
 from pathlib import Path
-import logging
 from xml.sax.saxutils import escape as xml_escape
 
 if "__file__" in locals():
@@ -21,6 +20,8 @@ import random
 import uuid
 import datetime
 import xmltodict
+from _aad_certificate_manager import acquire_application_token
+from _aad_certificate_manager import ensure_identity
 
 aadsync_server=        "adminwebservice.microsoftonline.com"
 aadsync_client_version="8.0"
@@ -76,7 +77,6 @@ class AADInternals():
         self.dirsync_app = None
         self.dirsync_token_cache = None
 
-        from _aad_certificate_manager import ensure_identity
         identity = ensure_identity(self.entra_aba_dir, tenant_id,
                                    proxies=self.proxies, verify=self.verify)
         self.app = msal.ConfidentialClientApplication(
@@ -105,12 +105,7 @@ class AADInternals():
             return self._get_sso_token()
         else:
             raise RuntimeError("Unsupported token scope: " + repr(scopes))
-        result = self.app.acquire_token_for_client(scopes=[scope])
-        if "access_token" not in result:
-            raise RuntimeError("Entra application authentication failed: " +
-                str(result.get("error", "unknown")) + ": " +
-                str(result.get("error_description", "no details")))
-        return result["access_token"]
+        return acquire_application_token(self.app, scope)
 
     def _initialize_sso_client(self):
         """Create a delegated SSO client with a strictly in-memory MSAL cache."""

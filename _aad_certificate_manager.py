@@ -46,6 +46,40 @@ ADMIN_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 ADMIN_SCOPES = ["Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All", "Directory.Read.All"]
 
 
+def missing_application_roles(scope: str, token: str) -> set[str]:
+    expected = {
+        SYNC_SCOPE: {"ADSynchronization.ReadWrite.All"},
+        GRAPH_SCOPE: {"User.Read.All", "Group.Read.All"},
+    }.get(scope, set())
+    claims = jwt.decode(token, options={"verify_signature": False})
+    return expected - set(claims.get("roles") or [])
+
+
+def acquire_application_token(app, scope: str) -> str:
+    """Wait until Microsoft Entra issues a token containing the required app roles."""
+    import msal
+    while True:
+        result = app.acquire_token_for_client(scopes=[scope])
+        if "access_token" not in result:
+            raise RuntimeError(f"Token request for {scope} was rejected: {result.get('error')} - {result.get('error_description')}")
+        token = result["access_token"]
+        missing = missing_application_roles(scope, token)
+        if not missing:
+            return token
+        # MSAL may cache a token without roles. Evict it before the next request.
+        cache = app.token_cache
+        for entry in list(cache.search(msal.TokenCache.CredentialType.ACCESS_TOKEN)):
+            if entry.get("secret") == token:
+                cache.remove_at(entry)
+        print(
+            f"[TOKEN] Missing permissions in latest {scope} access token: {', '.join(sorted(missing))}. "
+            "Microsoft Entra permission propagation may still be in progress. "
+            "Waiting 1 minute (60 seconds) before requesting a new token...",
+            flush=True,
+        )
+        time.sleep(60)
+
+
 def iso(dt):
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -219,10 +253,7 @@ def app_token(tenant: str, client: str, pfx: Path, passphrase: bytes, scope: str
     app = msal.ConfidentialClientApplication(
         client_id=client, authority=f"https://login.microsoftonline.com/{tenant}",
         client_credential={"private_key_pfx_path": str(pfx), "passphrase": passphrase.decode("utf-8")}, proxies=proxies, verify=verify)
-    result = app.acquire_token_for_client(scopes=[scope])
-    if "access_token" not in result:
-        raise RuntimeError(f"Token request for {scope} was rejected: {result.get('error')} - {result.get('error_description')}")
-    return result["access_token"]
+    return acquire_application_token(app, scope)
 
 
 class Graph:
