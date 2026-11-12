@@ -46,6 +46,17 @@ ADMIN_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 ADMIN_SCOPES = ["Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All", "Directory.Read.All"]
 
 
+class MaxRetryLimitReached(Exception):
+    """is thrown if an action couldn't be accomplished by the planned try counts."""
+
+
+# The optional "retry" mapping accepted below is forwarded unchanged to
+# acquire_application_token() and may contain any subset of its keywords:
+#   {"max_retries": int, "sleep_retry_time": int,
+#    "sleep_increment_by": int, "sleep_increment_multiplier": int}
+# Omitted keys keep that function's defaults, so retry=None preserves the
+# historical behaviour of waiting forever.
+
 def missing_application_roles(scope: str, token: str) -> set[str]:
     expected = {
         SYNC_SCOPE: {"ADSynchronization.ReadWrite.All"},
@@ -55,9 +66,30 @@ def missing_application_roles(scope: str, token: str) -> set[str]:
     return expected - set(claims.get("roles") or [])
 
 
-def acquire_application_token(app, scope: str) -> str:
-    """Wait until Microsoft Entra issues a token containing the required app roles."""
+def acquire_application_token(app, scope: str, max_retries: int = -1, sleep_retry_time: int = 60, sleep_increment_by: int = 0, sleep_increment_multiplier: int = 1) -> str:
+    """Wait until Microsoft Entra issues a token containing the required app roles.
+
+    max_retries caps the number of token requests. A negative value asks
+    forever, which stays the default: an interactive install must not give up
+    while permissions are still propagating. A caller that cannot block
+    indefinitely, such as a service, passes a positive value and handles
+    MaxRetryLimitReached.
+
+    The wait happens only between requests: never before the first one, which
+    is the common case of a healthy tenant, and never after the last one,
+    which would be spent only to give up afterwards.
+    """
     import msal
+    if sleep_retry_time < 1 or sleep_increment_multiplier < 1 or sleep_increment_by < 0:
+        # A wait that cannot grow past zero would flood the token endpoint.
+        raise ValueError(
+            "retry policy must keep a wait of at least one second between token requests: "
+            f"sleep_retry_time={sleep_retry_time}, sleep_increment_by={sleep_increment_by}, "
+            f"sleep_increment_multiplier={sleep_increment_multiplier}"
+        )
+    started = time.time()
+    attempt = 0
+    sleep_time = sleep_retry_time
     while True:
         result = app.acquire_token_for_client(scopes=[scope])
         if "access_token" not in result:
@@ -71,14 +103,25 @@ def acquire_application_token(app, scope: str) -> str:
         for entry in list(cache.search(msal.TokenCache.CredentialType.ACCESS_TOKEN)):
             if entry.get("secret") == token:
                 cache.remove_at(entry)
+        attempt += 1
+        if 0 <= max_retries <= attempt:
+            elapsed = int(time.time() - started)
+            raise MaxRetryLimitReached(
+                f'reached maximum tries ({attempt}) while waiting for the permissions '
+                f'{", ".join(sorted(missing))} on {scope}. Time spent while waiting ('
+                f'{elapsed // 86400} d, '
+                f'{(elapsed % 86400) // 3600:02d}:'
+                f'{(elapsed % 3600) // 60:02d}:'
+                f'{elapsed % 60:02d}).'
+            )
         print(
             f"[TOKEN] Missing permissions in latest {scope} access token: {', '.join(sorted(missing))}. "
             "Microsoft Entra permission propagation may still be in progress. "
-            "Waiting 1 minute (60 seconds) before requesting a new token...",
+            f"Waiting {sleep_time} seconds before requesting a new token...",
             flush=True,
         )
-        time.sleep(60)
-
+        time.sleep(sleep_time)
+        sleep_time = (sleep_time + sleep_increment_by) * sleep_increment_multiplier
 
 def iso(dt):
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -248,12 +291,12 @@ def auth_admin(tenant: str, client_id: str, *, proxies=None, verify=True):
     return result["access_token"]
 
 
-def app_token(tenant: str, client: str, pfx: Path, passphrase: bytes, scope: str, *, proxies=None, verify=True):
+def app_token(tenant: str, client: str, pfx: Path, passphrase: bytes, scope: str, *, proxies=None, verify=True, retry: dict | None = None):
     import msal
     app = msal.ConfidentialClientApplication(
         client_id=client, authority=f"https://login.microsoftonline.com/{tenant}",
         client_credential={"private_key_pfx_path": str(pfx), "passphrase": passphrase.decode("utf-8")}, proxies=proxies, verify=verify)
-    return acquire_application_token(app, scope)
+    return acquire_application_token(app, scope, **(retry or {}))
 
 
 class Graph:
@@ -416,7 +459,7 @@ def pop_token(app_object_id: str, old_pfx: Path, passphrase: bytes):
     return jwt.encode(claims, key, algorithm="RS256", headers={"x5t": thumb})
 
 
-def rotate(base: Path, threshold: int, days: int, force: bool, *, proxies=None, verify=True):
+def rotate(base: Path, threshold: int, days: int, force: bool, *, proxies=None, verify=True, retry: dict | None = None):
     with lock(base):
         state = read_state(base)
         if not state or state.get("status") != "ready":
@@ -440,14 +483,14 @@ def rotate(base: Path, threshold: int, days: int, force: bool, *, proxies=None, 
         # Recovery: if Graph accepted addKey before a crash, new PFX can already request tokens.
         works = False
         try:
-            app_token(state["tenant_id"], state["app_id"], base / pending, pwd, SYNC_SCOPE, proxies=proxies, verify=verify)
+            app_token(state["tenant_id"], state["app_id"], base / pending, pwd, SYNC_SCOPE, proxies=proxies, verify=verify, retry=retry)
             works = True
         except RuntimeError:
             pass
         new_key_id = state.get("pending_key_id")
         if not works:
             if not state.get("pending_key_id"):
-                current_graph_token = app_token(state["tenant_id"], state["app_id"], current, pwd, GRAPH_SCOPE, proxies=proxies, verify=verify)
+                current_graph_token = app_token(state["tenant_id"], state["app_id"], current, pwd, GRAPH_SCOPE, proxies=proxies, verify=verify, retry=retry)
                 graph = Graph(current_graph_token, proxies=proxies, verify=verify)
                 # Only the application's own key, with signed proof of possession.
                 result = graph.call("POST", f"/applications/{state['app_object_id']}/addKey", body={
@@ -463,7 +506,7 @@ def rotate(base: Path, threshold: int, days: int, force: bool, *, proxies=None, 
             last_error = None
             for _ in range(6):
                 try:
-                    app_token(state["tenant_id"], state["app_id"], base / pending, pwd, SYNC_SCOPE, proxies=proxies, verify=verify)
+                    app_token(state["tenant_id"], state["app_id"], base / pending, pwd, SYNC_SCOPE, proxies=proxies, verify=verify, retry=retry)
                     works = True
                     break
                 except RuntimeError as exc:
@@ -486,14 +529,14 @@ def rotate(base: Path, threshold: int, days: int, force: bool, *, proxies=None, 
         print("Previous certificate retained for rollback; remove retired keys separately using the cleanup command.")
 
 
-def cleanup(base: Path, grace: int, *, proxies=None, verify=True):
+def cleanup(base: Path, grace: int, *, proxies=None, verify=True, retry: dict | None = None):
     with lock(base):
         state = read_state(base)
         if not state or state.get("status") != "ready":
             raise RuntimeError("Initialization is incomplete")
         pwd = password(base)
         current = active_pfx(base)
-        token = app_token(state["tenant_id"], state["app_id"], current, pwd, GRAPH_SCOPE, proxies=proxies, verify=verify)
+        token = app_token(state["tenant_id"], state["app_id"], current, pwd, GRAPH_SCOPE, proxies=proxies, verify=verify, retry=retry)
         graph = Graph(token, proxies=proxies, verify=verify)
         keep = []
         for item in state.get("retired", []):
@@ -530,11 +573,16 @@ def status(base: Path):
         print("Retired certificates awaiting cleanup:", len(state["retired"]))
 
 
-def ensure_identity(base: Path, tenant_id: str, *, threshold: int = 30, days: int = 90, proxies=None, verify=True):
+def ensure_identity(base: Path, tenant_id: str, *, threshold: int = 30, days: int = 90, proxies=None, verify=True, retry: dict | None = None):
     """Called directly by AADInternals.__init__: bootstrap once, rotate when due.
 
     No network access during normal init when the cert is healthy. Fail closed
     when local identity material is missing; never generate a replacement app.
+
+    retry bounds the wait for permission propagation in rotate and cleanup,
+    which a service reaches unattended. bootstrap deliberately does not take
+    it: it already requires an interactive terminal, where waiting forever is
+    the friendlier default and the operator can interrupt.
     """
     state = read_state(base)
     if state and state.get("tenant_id") != tenant_id:
@@ -558,10 +606,12 @@ def ensure_identity(base: Path, tenant_id: str, *, threshold: int = 30, days: in
 
     if remaining <= threshold or state.get("pending_cert"):
         try:
-            rotate(base, threshold=threshold, days=days, force=False, proxies=proxies, verify=verify)
-        except (RuntimeError, OSError, requests.RequestException) as exc:
+            rotate(base, threshold=threshold, days=days, force=False, proxies=proxies, verify=verify, retry=retry)
+        except (MaxRetryLimitReached, RuntimeError, OSError, requests.RequestException) as exc:
             # Keep syncing with a still-valid existing certificate. Do not
             # advance local state or delete any key if the remote call failed.
+            # A reached retry limit is such a failure: rotation is retried on
+            # the next run rather than stopping a sync the old cert can serve.
             logging.getLogger(__name__).warning(
                 "Entra certificate rotation failed (%.1f days remaining): %s", remaining, exc)
     # Old keys are removed after a grace period, only if Graph confirms it.
@@ -570,8 +620,8 @@ def ensure_identity(base: Path, tenant_id: str, *, threshold: int = 30, days: in
     if retired and any(r.get("key_id") and now() - datetime.fromisoformat(
             r["retired_at"].replace("Z", "+00:00")) >= timedelta(days=14) for r in retired):
         try:
-            cleanup(base, grace=14, proxies=proxies, verify=verify)
-        except (RuntimeError, OSError, requests.RequestException) as exc:
+            cleanup(base, grace=14, proxies=proxies, verify=verify, retry=retry)
+        except (MaxRetryLimitReached, RuntimeError, OSError, requests.RequestException) as exc:
             logging.getLogger(__name__).warning("Cleanup of retired Entra keys postponed: %s", exc)
 
     return {
@@ -581,15 +631,15 @@ def ensure_identity(base: Path, tenant_id: str, *, threshold: int = 30, days: in
     }
 
 
-def verify(base: Path):
+def verify(base: Path, retry: dict | None = None):
     state = read_state(base)
     if not state or state.get("status") != "ready":
         raise RuntimeError("Initialization is incomplete")
     pwd = password(base)
-    app_token(state["tenant_id"], state["app_id"], active_pfx(base), pwd, SYNC_SCOPE)
+    app_token(state["tenant_id"], state["app_id"], active_pfx(base), pwd, SYNC_SCOPE, retry=retry)
     print("OK: Microsoft issued a synchronization access token using the certificate.")
     if state.get("include_graph_reads"):
-        app_token(state["tenant_id"], state["app_id"], active_pfx(base), pwd, GRAPH_SCOPE)
+        app_token(state["tenant_id"], state["app_id"], active_pfx(base), pwd, GRAPH_SCOPE, retry=retry)
         print("OK: Microsoft issued a Microsoft Graph access token.")
     print("Warning: this test does not validate acceptance of SOAP operations.")
 
@@ -607,11 +657,24 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force early rotation (test environment)")
     parser.add_argument("--no-graph-reads", action="store_true", help="Do not grant Graph read permissions")
     parser.add_argument("--apply", action="store_true", help="Confirm changes to remote resources")
+    # Bound the wait for Entra permission propagation, for verify/rotate/cleanup
+    # run unattended (health check, timer, ExecStartPre). Unset keeps waiting forever.
+    parser.add_argument("--max-retries", type=int,
+                        help="Token attempts while waiting for permission propagation; negative waits forever (default)")
+    parser.add_argument("--sleep-retry-time", type=int, help="Seconds before the first new token request (default 60)")
+    parser.add_argument("--sleep-increment-by", type=int, help="Seconds added to the wait after each attempt (default 0)")
+    parser.add_argument("--sleep-increment-multiplier", type=int, help="Factor applied to the wait after each attempt (default 1)")
     args = parser.parse_args()
     if args.days < 7 or args.days > 365:
         parser.error("--days must be between 7 and 365")
     if args.threshold_days < 1 or args.grace_days < 0:
         parser.error("Invalid threshold or grace period")
+    retry = {name: value for name, value in (
+        ("max_retries", args.max_retries),
+        ("sleep_retry_time", args.sleep_retry_time),
+        ("sleep_increment_by", args.sleep_increment_by),
+        ("sleep_increment_multiplier", args.sleep_increment_multiplier),
+    ) if value is not None} or None
     if args.command == "plan":
         print("Initial setup: RSA 2048 certificate, Entra application, service principal, and permissions")
         print("After setup: OAuth access token without refresh token; rotation via Graph addKey/self PoP")
@@ -630,19 +693,19 @@ def main():
     elif args.command == "status":
         status(args.state_dir)
     elif args.command == "verify":
-        verify(args.state_dir)
+        verify(args.state_dir, retry=retry)
     elif args.command == "rotate":
         if not args.apply:
             parser.error("Add --apply to authorize certificate rotation in Microsoft Entra")
-        rotate(args.state_dir, args.threshold_days, args.days, args.force)
+        rotate(args.state_dir, args.threshold_days, args.days, args.force, retry=retry)
     elif args.command == "cleanup":
         if not args.apply:
             parser.error("Add --apply to authorize removal of retired keys in Microsoft Entra")
-        cleanup(args.state_dir, args.grace_days)
+        cleanup(args.state_dir, args.grace_days, retry=retry)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (RuntimeError, OSError, requests.RequestException) as exc:
+    except (MaxRetryLimitReached, ValueError, RuntimeError, OSError, requests.RequestException) as exc:
         raise SystemExit(f"ERROR: {exc}") from exc

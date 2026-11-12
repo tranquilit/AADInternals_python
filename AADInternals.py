@@ -33,7 +33,7 @@ client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
 class AADInternals():
 
-    def __init__(self, proxies={}, tenant_id=None, domain=None, verify=True, entra_aba_dir="/root/entra_aba"):
+    def __init__(self, proxies={}, tenant_id=None, domain=None, verify=True, entra_aba_dir="/root/entra_aba", retry=None):
         """
         Initialize the certificate identity for ABA and Graph application access.
         SSO and DirSync admin tokens are acquired separately and remain in RAM.
@@ -77,8 +77,11 @@ class AADInternals():
         self.dirsync_app = None
         self.dirsync_token_cache = None
 
+        # Bounds the wait for Entra permission propagation on every token
+        # request made through this instance. None waits forever.
+        self.retry = retry
         identity = ensure_identity(self.entra_aba_dir, tenant_id,
-                                   proxies=self.proxies, verify=self.verify)
+                                   proxies=self.proxies, verify=self.verify, retry=self.retry)
         self.app = msal.ConfidentialClientApplication(
             identity["app_id"],
             authority=f"https://login.microsoftonline.com/{tenant_id}",
@@ -105,7 +108,7 @@ class AADInternals():
             return self._get_sso_token()
         else:
             raise RuntimeError("Unsupported token scope: " + repr(scopes))
-        return acquire_application_token(self.app, scope)
+        return acquire_application_token(self.app, scope, **(self.retry or {}))
 
     def _initialize_sso_client(self):
         """Create a delegated SSO client with a strictly in-memory MSAL cache."""
